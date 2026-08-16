@@ -23,10 +23,10 @@ how far along Claude is in the task it is currently working on.
 | Constraint | Consequence for design |
 |---|---|
 | Core TUI is not modifiable | Use the `statusLine` setting, which renders its own row above the footer badges |
-| A custom status line suppresses most footer keyboard hints, including `esc to interrupt` | Accepted tradeoff; note it in the README |
+| A custom status line suppresses most footer keyboard hints, including `esc to interrupt` | Not accepted — re-rendered on a second status line row (§6.3). There is no setting to keep the built-in hints |
 | Status line re-runs only on: session start, new assistant message, `/compact` finish, permission-mode change, vim toggle, or `refreshInterval` timer | `refreshInterval` is **required**, or the bar freezes during long agentic turns |
 | Updates debounce at 300ms; an in-flight script is cancelled if a new trigger fires | Script must be fast — no git calls, no subprocesses |
-| Only stdout is displayed; non-zero exit or empty output blanks the status line | Never raise; always print exactly one line |
+| Only stdout is displayed; non-zero exit or empty output blanks the status line | Never raise. Each `print` is one row; we print exactly two |
 | `statusLine` executes a shell command, so it is gated by workspace trust | Trust dialog must be accepted or the row stays blank |
 
 ## 4. Key design decision: what is the denominator?
@@ -57,12 +57,20 @@ TodoWrite tool call
 PostToolUse hook  ──writes──▶  /tmp/claude-progress-<session_id>   ("2/5")
                                         │
                                         ▼
-                        statusLine script ──prints──▶  status row
-                        (also reads context_window from stdin JSON)
+UserPromptSubmit ──creates──▶  /tmp/claude-busy-<session_id>  ──▶  statusLine script
+Stop / StopFailure ──deletes──▶            (existence = flag)       │
+                                                                    ▼
+                                                    row 1: model · dir · [bar] label
+                                                    row 2: keyboard hints
 ```
 
-Two decoupled processes communicating through one small file. The hook is the only
-writer; the status line is the only reader. Neither imports the other.
+Decoupled processes communicating through small files in `/tmp`. Hooks are the only
+writers; the status line is the only reader. Neither imports the other.
+
+**File permissions.** Both state files are opened with `O_NOFOLLOW` and mode `0600`, and
+the reader uses `lstat` rather than `stat`. `/tmp` is world-writable, so without that a
+symlink pre-planted at either path would make a hook truncate whatever it points at.
+`session_id` is a UUID, so this was never practically exploitable; the guard is free.
 
 **Why keyed on `session_id`:** concurrent Claude Code sessions in different repos
 would otherwise overwrite each other's progress state. `session_id` is stable for a
@@ -87,10 +95,36 @@ invocation.
      label `"N% (done/total tasks)"`.
   2. Otherwise `pct = context_window.used_percentage or 0`, label `"N% context"`.
   3. Render a 12-cell bar: green `█` for filled, dim `░` for remainder.
-  4. Print one line: `model · dirname · [bar] label`.
+  4. Print row 1: `model · dirname · [bar] label`.
+  5. Print row 2: the hints from §6.3.
 - **Colors:** ANSI `\033[32m` green, `\033[2m` dim, `\033[0m` reset.
 
-### 6.3 Settings
+### 6.3 `busy-state-hook.py` (UserPromptSubmit, Stop, StopFailure)
+
+Restores the keyboard hints that configuring a `statusLine` suppresses. The hints are
+only cosmetic — `esc` still interrupts either way — but losing the reminder is the single
+largest cost of using this project at all.
+
+Nothing in the status line's stdin reports whether a turn is in flight, so an
+unconditional `esc to interrupt` would be wrong whenever the session is idle. Instead:
+
+- `UserPromptSubmit` creates `/tmp/claude-busy-<session_id>`; `Stop` and `StopFailure`
+  delete it. Existence is the flag — there are no contents to parse.
+- The status line prints `esc to interrupt · ? for shortcuts` when the flag is up, and
+  `? for shortcuts` alone when it is down.
+
+**Two constraints specific to this hook**, both from the `UserPromptSubmit` contract:
+stdout is injected into the conversation as context, so it must print nothing; and exit
+code 2 blocks the user's prompt, so it must exit 0 unconditionally.
+
+**Unresolved:** `Stop` fires when Claude finishes responding and `StopFailure` when a turn
+ends due to an API error. Neither is documented as firing when the user interrupts with
+`esc`. If neither does, the flag stays up until the next prompt is submitted, and the hint
+is wrong for exactly that window. Needs a live test (§8.10). Do not paper over this with a
+staleness timeout — that would misreport long legitimate turns, which is the failure mode
+that matters more.
+
+### 6.4 Settings
 
 ```json
 {
@@ -103,6 +137,15 @@ invocation.
     "PostToolUse": [
       { "matcher": "TodoWrite",
         "hooks": [{ "type": "command", "command": "~/.claude/todo-progress-hook.py" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/busy-state-hook.py" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/busy-state-hook.py" }] }
+    ],
+    "StopFailure": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/busy-state-hook.py" }] }
     ]
   }
 }
@@ -119,10 +162,14 @@ invocation.
 | Hook fires for a non-`TodoWrite` tool | No-op |
 | Stale `/tmp` file from a prior session | Harmless — new session has a new `session_id` |
 | Very narrow terminal | Bar is fixed at 12 cells; total line stays short enough to survive truncation |
+| Busy flag cleared when already clear | `unlink` raises `FileNotFoundError`; swallowed, exit 0 |
+| Symlink pre-planted at either state path | Write refuses (`O_NOFOLLOW`); read treats it as absent and falls back |
+| Turn interrupted with `esc` | Unresolved — see §6.3 |
 
 ## 8. Success criteria
 
-Implementation is done when all of the following pass:
+Criteria 1-6, 8, and 9 are automated in `./test.sh` (26 assertions). Criteria 7 and 10
+require a live session and must be checked by hand.
 
 1. `echo '<mock TodoWrite JSON>' | ./todo-progress-hook.py` exits 0 and writes the
    expected `done/total` to `/tmp/claude-progress-<id>`.
@@ -135,6 +182,13 @@ Implementation is done when all of the following pass:
 7. In a live session, the bar advances as Claude marks todos complete, and continues
    updating during a long turn with no new assistant message (validates
    `refreshInterval`).
+8. The hint row reads `esc to interrupt · ? for shortcuts` while the busy flag is up and
+   `? for shortcuts` when it is down.
+9. A symlink planted at either state path is neither written through nor read through.
+10. **Live test, currently unverified.** Interrupt a turn with `esc`. The hint row must
+    drop back to `? for shortcuts`. If it stays on `esc to interrupt` until the next
+    prompt, neither `Stop` nor `StopFailure` fires on interrupt and §6.3 needs another
+    event — not a timeout.
 
 ## 9. Open questions
 

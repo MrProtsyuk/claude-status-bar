@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Claude Code status line: green progress bar.
- 
+
 Shows todo-list progress when a TodoWrite state file exists for this session,
-otherwise falls back to context-window usage.
+otherwise falls back to context-window usage. A second row carries the keyboard
+hints that a custom status line suppresses from the footer.
 """
 import json
 import os
+import stat
 import sys
  
 BAR_WIDTH = 12
@@ -30,14 +32,31 @@ def read_task_progress(session_id):
         return (done, total) if total > 0 else None
     except (OSError, ValueError):
         return None
- 
- 
+
+
+def is_busy(session_id):
+    """True while a turn is in flight, per the busy-state hook."""
+    try:
+        # lstat, not stat: a symlink at this path is not a flag we wrote.
+        return stat.S_ISREG(os.lstat(f"/tmp/claude-busy-{session_id}").st_mode)
+    except OSError:
+        return False
+
+
+def hints(session_id):
+    """The footer hints Claude Code stops drawing once a status line exists."""
+    parts = ["esc to interrupt"] if is_busy(session_id) else []
+    parts.append("? for shortcuts")
+    return f"{DIM}{' · '.join(parts)}{RESET}"
+
+
 def main():
     data = json.load(sys.stdin)
     model = data.get("model", {}).get("display_name", "Claude")
     cwd = os.path.basename(data.get("workspace", {}).get("current_dir", ""))
- 
-    progress = read_task_progress(data.get("session_id", ""))
+    session_id = data.get("session_id", "")
+
+    progress = read_task_progress(session_id)
     if progress:
         done, total = progress
         pct = round(done * 100 / total)
@@ -47,6 +66,7 @@ def main():
         detail = f"{pct}% {DIM}context{RESET}"
  
     print(f"{model} {DIM}·{RESET} {cwd} {DIM}·{RESET} {bar(pct)} {detail}")
+    print(hints(session_id))
  
  
 if __name__ == "__main__":
