@@ -116,6 +116,11 @@ Handled edge cases: missing state file, `used_percentage: null` (before the firs
 response and after `/compact`), an empty todo list (no `ZeroDivisionError`), malformed hook
 stdin, non-`TodoWrite` tools, and stale `/tmp` files from prior sessions.
 
+The state file is opened with `O_NOFOLLOW` and mode `0600`. `/tmp` is world-writable, so
+without that a symlink pre-planted at the state path would make the hook truncate whatever
+it points at. `session_id` is a UUID, so this was never practically exploitable — but the
+guard costs nothing on a shared host.
+
 **Known gap:** `statusline-progress.py` assumes well-formed JSON on stdin and will exit
 non-zero on garbage input, blanking the row until the next refresh. Claude Code always
 supplies valid JSON, so this only shows up in manual testing.

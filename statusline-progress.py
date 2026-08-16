@@ -23,7 +23,9 @@ def read_task_progress(session_id):
     """Return (done, total) from the state file the TodoWrite hook writes."""
     path = f"/tmp/claude-progress-{session_id}"
     try:
-        with open(path) as f:
+        # O_NOFOLLOW: refuse to read through a symlink planted in world-writable /tmp.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
             done, total = (int(x) for x in f.read().strip().split("/"))
         return (done, total) if total > 0 else None
     except (OSError, ValueError):
